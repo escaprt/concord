@@ -1,11 +1,13 @@
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { Auth } from "../src/auth.js";
 import { StellarSource } from "../src/chain.js";
 import { Concord } from "../src/concord.js";
 import { loadConfig } from "../src/config.js";
 import { Db } from "../src/db.js";
+import { createServerApp } from "../src/main.js";
 import { CONTROL_MIGRATIONS, ORG_MIGRATIONS } from "../src/schema.js";
 import { Tenants, fileStore, memoryStore } from "../src/tenants.js";
 import { Client, FakeChain, MAINNET_PASSPHRASE, ORIGIN, PASSPHRASE, at, harness, key, u, type Harness } from "./helpers.js";
@@ -807,5 +809,51 @@ describe("what ships", () => {
     const org = new Db(":memory:", ORG_MIGRATIONS);
     expect(org.get<{ foreign_keys: number }>("PRAGMA foreign_keys")!.foreign_keys).toBe(1);
     expect(() => new Db(":memory:", [...ORG_MIGRATIONS, "CREATE TABLE broken (x REFERENCES nowhere (y)); INSERT INTO broken VALUES (1);"])).toThrow();
+  });
+
+  it("returns 404 for missing files with an extension while extensionless routes get index.html", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "concord-static-"));
+    const webDir = join(dir, "web");
+    const dataDir = join(dir, "data");
+    mkdirSync(join(webDir, "assets"), { recursive: true });
+    mkdirSync(dataDir, { recursive: true });
+
+    writeFileSync(join(webDir, "index.html"), "<html>shell</html>");
+    writeFileSync(join(webDir, "favicon.ico"), "fake-ico");
+
+    const cfg = loadConfig({
+      CONCORD_DATA_DIR: dataDir,
+      CONCORD_WEB_DIR: webDir,
+      CONCORD_SIGNUP: "open",
+    });
+    const control = new Db(join(dataDir, "control.db"), CONTROL_MIGRATIONS);
+    const auth = new Auth(control, { signup: "open" });
+    const tenants = new Tenants(fileStore(dataDir), {}, () => false, () => []);
+    const runtime = { control, auth, tenants, close: () => { tenants.close(); control.close(); } };
+    const app = createServerApp(runtime, cfg);
+
+    try {
+      // Existing file returns 200
+      const resFavicon = await app.request("/favicon.ico");
+      expect(resFavicon.status).toBe(200);
+
+      // Missing files with an extension return 404
+      const resMissingIco = await app.request("/missing-favicon.ico");
+      expect(resMissingIco.status).toBe(404);
+
+      const resMissingJs = await app.request("/a/b/c.js");
+      expect(resMissingJs.status).toBe(404);
+
+      const resMissingTxt = await app.request("/robots.txt");
+      expect(resMissingTxt.status).toBe(404);
+
+      // Extensionless route falls back to SPA index.html
+      const resSpa = await app.request("/a/abc/reconciliation");
+      expect(resSpa.status).toBe(200);
+      expect(await resSpa.text()).toBe("<html>shell</html>");
+    } finally {
+      runtime.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

@@ -56,8 +56,7 @@ export function openRuntime(config: Config): Runtime {
   };
 }
 
-export function startServer(config: Config = loadConfig()): void {
-  const runtime = openRuntime(config);
+export function createServerApp(runtime: Runtime, config: Config): Hono {
   const secure = config.publicUrl.startsWith("https://");
   const app = new Hono();
 
@@ -111,8 +110,11 @@ export function startServer(config: Config = loadConfig()): void {
     // The separator matters: without it a sibling directory sharing the prefix would count as inside.
     const inside = path === config.webDir || path.startsWith(config.webDir + sep);
     const found = inside && existsSync(path) && statSync(path).isFile();
-    // A build asset that is not there is a 404; only page routes fall back to the app shell.
-    if (!found && requested.startsWith("/assets/")) return c.text("Not found", 404);
+    // A build asset that is not there, or any missing file with an extension, is a 404; only extensionless routes fall back to the app shell.
+    const segments = requested.split("/").filter(Boolean);
+    const lastSegment = segments[segments.length - 1] ?? "";
+    const hasExtension = extname(lastSegment) !== "";
+    if (!found && (hasExtension || requested.startsWith("/assets/"))) return c.text("Not found", 404);
     const file = found ? path : join(config.webDir, "index.html");
     return c.body(new Uint8Array(readFileSync(file)), 200, {
       "content-type": MIME[extname(file)] ?? "application/octet-stream",
@@ -120,6 +122,14 @@ export function startServer(config: Config = loadConfig()): void {
       "cache-control": found && requested.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache",
     });
   });
+
+  return app;
+}
+
+export function startServer(config: Config = loadConfig()): void {
+  const runtime = openRuntime(config);
+  const secure = config.publicUrl.startsWith("https://");
+  const app = createServerApp(runtime, config);
 
   const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
     console.log(`concord · ${config.publicUrl} · listening on ${config.host}:${info.port}`);
