@@ -808,4 +808,20 @@ describe("what ships", () => {
     expect(org.get<{ foreign_keys: number }>("PRAGMA foreign_keys")!.foreign_keys).toBe(1);
     expect(() => new Db(":memory:", [...ORG_MIGRATIONS, "CREATE TABLE broken (x REFERENCES nowhere (y)); INSERT INTO broken VALUES (1);"])).toThrow();
   });
+
+  it("does not mask the original error when rollback fails in tx and migrate", () => {
+    // 1. In migrate: COMMIT inside migration followed by invalid statement
+    expect(() => {
+      new Db(":memory:", ["CREATE TABLE a (x); COMMIT; CREATE TABLE b (y;"]);
+    }).toThrow(/syntax error|near/i);
+
+    // 2. In tx: transaction already committed or rolled back inside fn
+    const db = new Db(":memory:", []);
+    expect(() => {
+      db.tx(() => {
+        db.raw.exec("COMMIT");
+        throw new Error("original failure");
+      });
+    }).toThrow("original failure");
+  });
 });
