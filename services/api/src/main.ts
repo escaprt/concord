@@ -56,8 +56,7 @@ export function openRuntime(config: Config): Runtime {
   };
 }
 
-export function startServer(config: Config = loadConfig()): void {
-  const runtime = openRuntime(config);
+export function createServerApp(runtime: Runtime, config: Config): Hono {
   const secure = config.publicUrl.startsWith("https://");
   const app = new Hono();
 
@@ -107,6 +106,12 @@ export function startServer(config: Config = loadConfig()): void {
     } catch {
       return c.text("Bad request", 400);
     }
+    // Refuse dotfile segments (e.g. /.hidden, /a/.git/config).
+    const segments = requested.split("/").filter(Boolean);
+    if (segments.some((s) => s.startsWith("."))) {
+      return c.text("Not found", 404);
+    }
+
     const path = normalize(join(config.webDir, requested));
     // The separator matters: without it a sibling directory sharing the prefix would count as inside.
     const inside = path === config.webDir || path.startsWith(config.webDir + sep);
@@ -120,6 +125,14 @@ export function startServer(config: Config = loadConfig()): void {
       "cache-control": found && requested.startsWith("/assets/") ? "public, max-age=31536000, immutable" : "no-cache",
     });
   });
+
+  return app;
+}
+
+export function startServer(config: Config = loadConfig()): void {
+  const runtime = openRuntime(config);
+  const secure = config.publicUrl.startsWith("https://");
+  const app = createServerApp(runtime, config);
 
   const server = serve({ fetch: app.fetch, hostname: config.host, port: config.port }, (info) => {
     console.log(`concord · ${config.publicUrl} · listening on ${config.host}:${info.port}`);
