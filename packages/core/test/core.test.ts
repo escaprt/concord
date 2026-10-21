@@ -14,6 +14,7 @@ import {
   reconcilePositions,
   redemptionDeltas,
   replay,
+  sortEvents,
   splitDeltas,
   toCsv,
   type Opening,
@@ -82,6 +83,20 @@ describe("replay", () => {
   it("flags holders whose history is incomplete", () => {
     const s = replay([ev("transfer", 9, { from: "X", to: "Y", amount: u(1) })]);
     expect(s.incomplete).toEqual(["X"]);
+  });
+
+  it("orders unpadded ids by number, not as strings", () => {
+    const later = { ...ev("transfer", 10, { from: "A", to: "B", amount: u(1) }), id: "10-1" };
+    const earlier = { ...ev("mint", 9, { to: "A", amount: u(5) }), id: "9-1" };
+    expect(sortEvents([later, earlier]).map((e) => e.id)).toEqual(["9-1", "10-1"]);
+    expect(replay([later, earlier], { upToLedger: 9 }).balances.get("A")).toBe(u(5));
+    const rpc = ["0000000429496729600-0000000002", "0000000429496729600-0000000001"];
+    expect(sortEvents(rpc.map((id) => ({ id }))).map((e) => e.id)).toEqual([rpc[1], rpc[0]]);
+  });
+
+  it("rejects ids that are not in the RPC form", () => {
+    expect(() => sortEvents([{ id: "9-1" }, { id: "abc" }])).toThrow(/event id "abc"/);
+    expect(() => replay([{ ...ev("mint", 1, { to: "A", amount: u(1) }), id: "1" }])).toThrow(/RPC form/);
   });
 });
 
@@ -165,6 +180,24 @@ describe("movement reconciliation", () => {
     const r = reconcileMovements(events, [], { from: "2026-10-01T00:25:00Z", to: "2026-10-01T00:45:00Z" });
     expect(r.breaks.map((b) => b.txHash)).toEqual(["cc", "dd"]);
   });
+
+  it("does not pair an entry citing tx_hash aa with an event from tx bb by attributes", () => {
+    const evs = [
+      ev("transfer", 20, { from: "A", to: "B", amount: u(10), txHash: "bb" }),
+    ];
+    const { entries } = parseJournalCsv(
+      "ref,date,type,from_account,to_account,units,tx_hash\nJ1,2026-10-01,transfer,A,B,10,aa\n",
+    );
+    const r = reconcileMovements(evs, entries);
+    expect(r.matches).toHaveLength(0);
+    expect(r.breaks.map((b) => b.type).sort()).toEqual([
+      "UNRECORDED_MOVEMENT",
+      "UNSETTLED_ENTRY",
+    ]);
+    const unsettled = r.breaks.find((b) => b.type === "UNSETTLED_ENTRY")!;
+    expect(unsettled.ref).toBe("J1");
+    expect(unsettled.txHash).toBe("aa");
+  });
 });
 
 describe("corporate actions", () => {
@@ -205,6 +238,16 @@ describe("corporate actions", () => {
     expect(r.summary.difference).toBe(-172_834n);
   });
 
+  it("does not count a payer's transfer to itself as a distribution", () => {
+    const cash = [
+      ev("transfer", 10, { from: "PAYER", to: "PAYER", amount: u(9) }),
+      ev("transfer", 10, { from: "PAYER", to: "A", amount: u(1) }),
+    ];
+    const observed = observeFlows(cash, { fromLedger: 6, plus: ["transfer"], minus: [], payer: "PAYER" });
+    expect(observed.has("PAYER")).toBe(false);
+    expect(observed.get("A")!.amount).toBe(u(1));
+  });
+
   it("reports an unpaid holder", () => {
     const expected = dividendEntitlements(snapshot, { ratePerUnit: "1", baseDecimals: 7, payDecimals: 2 });
     expect(expected.get("B")).toBe(5000n);
@@ -234,6 +277,17 @@ describe("corporate actions", () => {
     const observed = observeFlows(flows, { fromLedger: 15, plus: [], minus: ["burn", "clawback"] });
     const r = reconcileDistribution(snapshot, full, observed);
     expect(r.breaks.map((b) => `${b.type}:${b.address}`)).toEqual(["SHORT:B"]);
+  });
+
+  it("rates opposite-sign flow as high severity UNEXPECTED", () => {
+    const expected = new Map([["A", u(100)]]);
+    const observed = new Map([["A", { amount: -u(100), txHashes: ["tx1"] }]]);
+    const r = reconcileDistribution(snapshot, expected, observed);
+    expect(r.breaks).toHaveLength(1);
+    const b = r.breaks[0]!;
+    expect(b.type).toBe("UNEXPECTED");
+    expect(b.severity).toBe("high");
+    expect(b.address).toBe("A");
   });
 });
 

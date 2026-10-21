@@ -51,8 +51,13 @@ describe("decodeEvent", () => {
     });
     expect(decodeEvent(raw([sym("mint"), addr(b), str(`FUND:${a}`)], i128(7n)))).toMatchObject({ to: b, amount: 7n });
     expect(decodeEvent(raw([sym("clawback"), addr(b), str(`FUND:${a}`)], i128(7n)))).toMatchObject({ from: b });
-    const auth = decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], nativeToScVal(false).toXDR("base64")));
-    expect(auth).toMatchObject({ kind: "set_authorized", from: b, authorized: false, amount: 0n });
+    const authFalse = decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], nativeToScVal(false).toXDR("base64")));
+    expect(authFalse).toMatchObject({ kind: "set_authorized", from: b, authorized: false, amount: 0n });
+    const authTrue = decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], nativeToScVal(true).toXDR("base64")));
+    expect(authTrue).toMatchObject({ kind: "set_authorized", from: b, authorized: true, amount: 0n });
+    expect(decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], str("false")))).toBeUndefined();
+    expect(decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], i128(1n)))).toBeUndefined();
+    expect(decodeEvent(raw([sym("set_authorized"), addr(b), str(`FUND:${a}`)], nativeToScVal(undefined, { type: "void" }).toXDR("base64")))).toBeUndefined();
   });
 
   it("takes the subject from the last address when an admin leads, and reads muxed values", () => {
@@ -63,6 +68,15 @@ describe("decodeEvent", () => {
 
   it("ignores events outside the asset set", () => {
     expect(decodeEvent(raw([sym("approve"), addr(a), addr(b)], i128(1n)))).toBeUndefined();
+  });
+
+  it("returns undefined without throwing when ledgerClosedAt is unparseable", () => {
+    const invalidDateRaw = {
+      ...raw([sym("transfer"), addr(a), addr(b), str(`FUND:${a}`)], i128(5n)),
+      ledgerClosedAt: "garbage",
+    };
+    expect(() => decodeEvent(invalidDateRaw)).not.toThrow();
+    expect(decodeEvent(invalidDateRaw)).toBeUndefined();
   });
 });
 
@@ -220,6 +234,28 @@ describe("Concord", () => {
     expect((await concord.reconcileAction(split.id)).state).toBe("clean");
   });
 
+  it("rejects non-address payer and warns on a silent payer", async () => {
+    await expect(
+      concord.createAction("FUND", {
+        type: "dividend",
+        recordTime: at(5),
+        ratePerUnit: "0.1",
+        payer: "bogus payer",
+      }),
+    ).rejects.toThrow("payer must be a valid Stellar address");
+
+    const silentPayer = key();
+    const action = await concord.createAction("FUND", {
+      type: "dividend",
+      recordTime: at(5),
+      ratePerUnit: "0.1",
+      payer: silentPayer,
+    });
+    expect(action.result!.warnings).toEqual(
+      expect.arrayContaining([expect.stringContaining(`Payer ${silentPayer} has no recorded flows in the action window`)]),
+    );
+  });
+
   it("holds an action as scheduled until the chain passes its record time", async () => {
     const action = await concord.createAction("FUND", { type: "redemption", recordTime: at(150), num: "1", den: "1" });
     expect(action.state).toBe("scheduled");
@@ -228,6 +264,33 @@ describe("Concord", () => {
     const later = await concord.reconcileAction(action.id);
     expect(later.snapshot!.holderCount).toBe(3);
     expect(later.result!.breaks.map((b) => [b.type, b.address])).toEqual([["MISSING", h2]]);
+  });
+
+  it("refuses to snapshot when record time is earlier than history start on a baseline asset", async () => {
+    const other = key();
+    chain.latest = 200;
+    chain.baselineResult = {
+      ledger: 150,
+      openings: new Map([
+        [h1, { amount: u(70), authorized: true, asOfLedger: 150 }],
+        [h2, { amount: u(30), asOfLedger: 150 }],
+      ]),
+    };
+    const asset = await concord.watchAsset({ network: "testnet", asset: `OLD:${other}` });
+    chain.push(asset.id, "transfer", 151, { from: h1, to: h2, amount: u(5) });
+    await concord.sync("OLD");
+
+    const action = await concord.createAction("OLD", {
+      type: "dividend",
+      recordTime: at(100),
+      ratePerUnit: "1",
+    });
+    expect(action.snapshot).toBeNull();
+    expect(action.state).toBe("scheduled");
+    expect(action.result).not.toBeNull();
+    expect(action.result!.warnings).toEqual([
+      expect.stringContaining("earlier than history start"),
+    ]);
   });
 
   it("builds the controls log and the audit pack", async () => {
