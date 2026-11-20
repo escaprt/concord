@@ -3,9 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { openRuntime } from "../src/main.js";
-import { loadConfig } from "../src/config.js";
+import { loadConfig, type Config } from "../src/config.js";
 
 const tsx = fileURLToPath(import.meta.resolve("tsx/cli"));
 const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
@@ -13,11 +13,12 @@ const cliPath = fileURLToPath(new URL("../src/cli.ts", import.meta.url));
 describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
   let dataDir: string;
   let orgId: string;
+  let config: Config;
   const assetCode = "TEST";
 
   beforeAll(async () => {
     dataDir = mkdtempSync(join(tmpdir(), "concord-cli-test-"));
-    const config = loadConfig({ CONCORD_DATA_DIR: dataDir });
+    config = loadConfig({ CONCORD_DATA_DIR: dataDir });
     const runtime = openRuntime(config);
     const { orgId: newOrgId } = await runtime.auth.signUp({
       email: "user@example.test",
@@ -41,6 +42,13 @@ describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
       "ready",
       "2026-10-01T00:00:00Z",
     );
+    runtime.close();
+  });
+
+  beforeEach(async () => {
+    const runtime = openRuntime(config);
+    const concord = runtime.tenants.forOrg(orgId);
+    concord.db.raw.exec("DELETE FROM runs; DELETE FROM registers; DELETE FROM register_positions;");
 
     const csv1 = "holder_id,account,units,status\nH1,GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5,100,active\n";
     const reg1 = concord.importRegister(
@@ -143,7 +151,7 @@ describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
 
   it("deletes a register with --yes and reports how many runs went with it", () => {
     const listBefore = JSON.parse(run(["registers", assetCode, "--json"]).stdout);
-    expect(listBefore).toHaveLength(1);
+    expect(listBefore).toHaveLength(2);
     const regId = listBefore[0].id;
 
     // Delete with --yes
@@ -153,7 +161,8 @@ describe("CLI registers and register-delete", { timeout: 30_000 }, () => {
 
     // Verify it is gone from the list
     const listAfter = JSON.parse(run(["registers", assetCode, "--json"]).stdout);
-    expect(listAfter).toHaveLength(0);
+    expect(listAfter).toHaveLength(1);
+    expect(listAfter[0].id).not.toBe(regId);
   });
 
   it("fails cleanly when deleting a nonexistent register", () => {
