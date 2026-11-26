@@ -1,23 +1,21 @@
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, basename } from "node:path";
+import { createInterface } from "node:readline/promises";
+import { pathToFileURL } from "node:url";
 import { DatabaseSync, backup } from "node:sqlite";
 import { parseArgs } from "node:util";
-import type { ActionInput, Actor, Concord, WatchInput } from "./concord.js";
+import { NotFound, type ActionInput, type Actor, type Concord, type WatchInput } from "./concord.js";
 import { isNetworkName, loadConfig } from "./config.js";
 import { openRuntime, startServer } from "./main.js";
-import { USAGE } from "./cli-usage.js";
+import { CLI_OPTIONS, USAGE, describeArgsError } from "./cli-usage.js";
 
 function table(rows: Array<Record<string, unknown>>): void {
   if (rows.length === 0) return console.log("(none)");
   console.table(rows);
 }
 
-function need(value: string | undefined, what: string): string {
-  if (!value) throw new Error(`missing ${what}\n\n${USAGE}`);
-  return value;
-}
-
+/** Open a backup copy read-only and check its integrity and schema version; throws naming the file. */
 export function verifyBackupFile(filePath: string, expectedUserVersion: number): void {
   let db: DatabaseSync;
   try {
@@ -29,20 +27,14 @@ export function verifyBackupFile(filePath: string, expectedUserVersion: number):
   try {
     const rows = db.prepare("PRAGMA integrity_check").all() as Array<Record<string, unknown>>;
     const result = rows.length > 0 ? String(Object.values(rows[0]!)[0]) : "";
-    if (result !== "ok") {
-      throw new Error(`corrupted backup: ${filePath} failed integrity check (${result})`);
-    }
+    if (result !== "ok") throw new Error(`corrupted backup: ${filePath} failed integrity check (${result})`);
     const versionRow = db.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
     const version = versionRow ? Number(Object.values(versionRow)[0]) : -1;
     if (version !== expectedUserVersion) {
-      throw new Error(
-        `corrupted backup: ${filePath} user_version mismatch (expected ${expectedUserVersion}, got ${version})`,
-      );
+      throw new Error(`corrupted backup: ${filePath} user_version mismatch (expected ${expectedUserVersion}, got ${version})`);
     }
   } catch (err: unknown) {
-    if (err instanceof Error && err.message.startsWith("corrupted backup:")) {
-      throw err;
-    }
+    if (err instanceof Error && err.message.startsWith("corrupted backup:")) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     throw new Error(`corrupted backup: ${filePath} failed integrity check (${msg})`);
   } finally {
@@ -50,55 +42,39 @@ export function verifyBackupFile(filePath: string, expectedUserVersion: number):
   }
 }
 
-async function main(): Promise<void> {
-  const { positionals, values } = parseArgs({
-    args: process.argv.slice(2),
-    allowPositionals: true,
-    options: {
-      org: { type: "string" },
-      network: { type: "string" },
-      name: { type: "string" },
-      "no-baseline": { type: "boolean" },
-      from: { type: "string" },
-      to: { type: "string" },
-      ignore: { type: "string" },
-      decimals: { type: "string" },
-      "as-of": { type: "string" },
-      register: { type: "string" },
-      record: { type: "string" },
-      rate: { type: "string" },
-      ratio: { type: "string" },
-      "pay-asset": { type: "string" },
-      payer: { type: "string" },
-      until: { type: "string" },
-      label: { type: "string" },
-      exclude: { type: "string" },
-      csv: { type: "string" },
-      out: { type: "string" },
-      note: { type: "string" },
-      json: { type: "boolean" },
-      verify: { type: "boolean" },
-      into: { type: "string" },
-      force: { type: "boolean", short: "f" },
-      help: { type: "boolean", short: "h" },
-    },
-  });
+function userVersion(db: DatabaseSync): number {
+  const row = db.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
+  return row ? Number(Object.values(row)[0]) : 0;
+}
+
+function parseCommandLine(args: string[]) {
+  try {
+    return parseArgs({ args, allowPositionals: true, options: CLI_OPTIONS });
+  } catch (err) {
+    const message = describeArgsError(err, args);
+    if (message) throw new Error(message);
+    throw err;
+  }
+}
+
+export async function runCli(
+  argv: string[] = process.argv.slice(2),
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<void> {
+  const { positionals, values } = parseCommandLine(argv);
   const [command, a, b] = positionals;
   if (!command || values.help) return console.log(USAGE);
   if (command === "serve") return startServer();
   if (command === "restore") {
-    const srcDir = resolve(need(a, "backup directory"));
-    const config = loadConfig();
-    const destDir = resolve(values.into ?? config.dataDir);
-    const controlSrc = join(srcDir, "control.db");
-    if (!existsSync(controlSrc)) {
+    // Runs without opening the runtime: the destination must not be in use.
+    if (!a) throw new Error(`missing backup directory\n\n${USAGE}`);
+    const srcDir = resolve(a);
+    const destDir = resolve(values.into ?? loadConfig(env).dataDir);
+    if (!existsSync(join(srcDir, "control.db"))) {
       throw new Error(`not a valid backup directory: missing control.db in ${srcDir}`);
     }
-    if (existsSync(destDir)) {
-      const entries = readdirSync(destDir);
-      if (entries.length > 0 && !values.force) {
-        throw new Error(`destination directory ${destDir} is not empty; pass --force to overwrite`);
-      }
+    if (existsSync(destDir) && readdirSync(destDir).length > 0 && !values.force) {
+      throw new Error(`destination directory ${destDir} is not empty; pass --force to overwrite`);
     }
     mkdirSync(destDir, { recursive: true });
     cpSync(srcDir, destDir, { recursive: true, force: true });
@@ -106,19 +82,18 @@ async function main(): Promise<void> {
     return;
   }
 
-  const config = loadConfig();
+  const config = loadConfig(env);
   const runtime = openRuntime(config);
-  const { auth, tenants } = runtime;
-  const actor: Actor = { id: "cli", label: `cli:${userInfo().username}` };
-  const list = (value: string | undefined) =>
-    value
-      ? value
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean)
-      : [];
-  const out = (value: unknown) => console.log(JSON.stringify(value, null, 2));
-  const orgRef = values.org ?? process.env.CONCORD_ORG;
+  try {
+    const { auth, tenants } = runtime;
+    const actor: Actor = { id: "cli", label: `cli:${userInfo().username}` };
+    const need = (value: string | undefined, what: string): string => {
+      if (!value) throw new Error(`missing ${what}\n\n${USAGE}`);
+      return value;
+    };
+    const list = (value: string | undefined) => (value ? value.split(",").map((s) => s.trim()).filter(Boolean) : []);
+    const out = (value: unknown) => console.log(JSON.stringify(value, null, 2));
+    const orgRef = values.org ?? env.CONCORD_ORG;
   const workspace = (): Concord => tenants.forOrg(auth.findOrg(need(orgRef, "--org (see `concord orgs`)")).id);
   const printRun = (run: Awaited<ReturnType<Concord["reconcile"]>>) => {
     if (values.json) return out(run);
@@ -153,6 +128,17 @@ async function main(): Promise<void> {
       console.log(`${config.publicUrl}/#/reset/${auth.createResetToken(need(a, "email"))}`);
       console.log("Valid for one day, once. Send it to the account's owner over a channel you trust.");
       break;
+    case "invite": {
+      const org = auth.findOrg(need(a, "workspace"));
+      const email = need(b, "email");
+      if (values.role !== undefined && values.role !== "owner" && values.role !== "member") {
+        throw new Error("--role must be owner or member");
+      }
+      const invite = auth.createInviteAs(org.id, email, values.role ?? "member", actor.label);
+      console.log(`${config.publicUrl}/#/invite/${invite.token}`);
+      console.log("Valid for 7 days, once. Send it to the invited person over a channel you trust.");
+      break;
+    }
     case "org-delete": {
       const org = auth.findOrg(need(a, "workspace"));
       auth.deleteOrg(org.id);
@@ -165,21 +151,12 @@ async function main(): Promise<void> {
       mkdirSync(join(dir, "orgs"), { recursive: true });
       const controlFile = join(dir, "control.db");
       await backup(runtime.control.raw, controlFile);
-      if (values.verify) {
-        const controlVerRow = runtime.control.raw.prepare("PRAGMA user_version").get() as
-          Record<string, unknown> | undefined;
-        const expectedVer = controlVerRow ? Number(Object.values(controlVerRow)[0]) : 0;
-        verifyBackupFile(controlFile, expectedVer);
-      }
+      if (values.verify) verifyBackupFile(controlFile, userVersion(runtime.control.raw));
       for (const id of auth.orgIds()) {
         const orgFile = join(dir, "orgs", `${id}.db`);
         const orgDb = tenants.forOrg(id).db.raw;
         await backup(orgDb, orgFile);
-        if (values.verify) {
-          const orgVerRow = orgDb.prepare("PRAGMA user_version").get() as Record<string, unknown> | undefined;
-          const expectedVer = orgVerRow ? Number(Object.values(orgVerRow)[0]) : 0;
-          verifyBackupFile(orgFile, expectedVer);
-        }
+        if (values.verify) verifyBackupFile(orgFile, userVersion(orgDb));
       }
       console.log(`backed up control.db and ${auth.orgIds().length} workspaces to ${dir}`);
       break;
@@ -197,9 +174,7 @@ async function main(): Promise<void> {
       const concord = workspace();
       const asset = await concord.watchAsset(input, { actor });
       const { added } = await concord.sync(asset.id);
-      console.log(
-        `watching ${asset.code} (${asset.id}) on ${asset.network} from ledger ${asset.startLedger}; ${added} events indexed`,
-      );
+      console.log(`watching ${asset.code} (${asset.id}) on ${asset.network} from ledger ${asset.startLedger}; ${added} events indexed`);
       break;
     }
     case "unwatch":
@@ -246,21 +221,61 @@ async function main(): Promise<void> {
       const file = need(b, "file");
       const imported = concord.importRegister(
         asset,
-        { csv: readFileSync(file, "utf8"), asOf: need(values["as-of"], "--as-of"), source: file },
+        { csv: readFileSync(file, "utf8"), asOf: need(values["as-of"], "--as-of"), source: basename(file) },
         actor,
       );
       if (imported.duplicate) {
         console.log(`register ${imported.registerId}: already imported (same file and as-of time), not added again`);
       } else {
-        console.log(
-          `register ${imported.registerId}: ${imported.positions} positions, ${imported.issues.length} rejected rows`,
-        );
+        console.log(`register ${imported.registerId}: ${imported.positions} positions, ${imported.issues.length} rejected rows`);
         for (const issue of imported.issues) console.log(`  line ${issue.line}: ${issue.message}`);
       }
-      printRun(
+      const run =
         (imported.duplicate && concord.latestRunForRegister(imported.registerId)) ||
-          (await concord.reconcile(asset, imported.registerId, actor)),
+        (await concord.reconcile(asset, imported.registerId, actor));
+      printRun(run);
+      if (values["fail-on-breaks"] && run.openBreaks > 0) process.exitCode = 2;
+      break;
+    }
+    case "registers": {
+      const asset = need(a, "asset");
+      const list = workspace().registers(asset);
+      if (values.json) return out(list);
+      table(
+        list.map((r) => ({
+          id: r.id,
+          "as-of": r.asOf,
+          source: r.source,
+          positions: r.positions,
+          "rejected rows": r.issues.length,
+          importer: r.importedBy ?? "",
+        })),
       );
+      break;
+    }
+    case "register-delete": {
+      const asset = need(a, "asset");
+      const registerId = Number(need(b, "register id"));
+      if (Number.isNaN(registerId)) throw new Error("register id must be a number");
+      if (!values.yes) {
+        const rl = createInterface({ input: process.stdin, output: process.stdout });
+        try {
+          const answer = await rl.question(`Delete register ${registerId} and all associated runs? [y/N] `);
+          if (!/^y(es)?$/i.test(answer.trim())) {
+            console.log("aborted");
+            break;
+          }
+        } finally {
+          rl.close();
+          process.stdin.pause();
+        }
+      }
+      const { runs } = workspace().deleteRegister(asset, registerId);
+      if (values.json) {
+        out({ deleted: registerId, runs });
+      } else {
+        console.log(`deleted register ${registerId} (${runs} reconciliation ${runs === 1 ? "run" : "runs"} removed)`);
+      }
       break;
     }
     case "journal":
@@ -269,11 +284,83 @@ async function main(): Promise<void> {
     case "instructions":
       out(workspace().importInstructions(need(a, "asset"), readFileSync(need(b, "file"), "utf8")));
       break;
-    case "reconcile":
-      printRun(
-        await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor),
+    case "journal-list": {
+      const limit = values.limit ? Number(values.limit) : undefined;
+      const rows = workspace().journalEntries(need(a, "asset"), {
+        ...(limit !== undefined ? { limit } : {}),
+        ...(values.before ? { before: values.before } : {}),
+      });
+      if (values.json) {
+        out(rows);
+        break;
+      }
+      table(
+        rows.map((r) => ({
+          ref: r.ref,
+          date: r.date,
+          type: r.type,
+          from: r.from ?? "",
+          to: r.to ?? "",
+          units: r.units,
+          txHash: r.txHash ?? "",
+          status: r.status ?? "",
+        })),
       );
       break;
+    }
+    case "instructions-list": {
+      const rows = workspace().instructionList(need(a, "asset"));
+      if (values.json) {
+        out(rows);
+        break;
+      }
+      table(
+        rows.map((r) => ({
+          ref: r.ref,
+          type: r.type,
+          account: r.account,
+          units: r.units ?? "",
+          issuedAt: r.issuedAt,
+          approvedBy: r.approvedBy ?? "",
+          reason: r.reason ?? "",
+        })),
+      );
+      break;
+    }
+    case "reconcile": {
+      const run = await workspace().reconcile(need(a, "asset"), values.register ? Number(values.register) : undefined, actor);
+      printRun(run);
+      if (values["fail-on-breaks"] && run.openBreaks > 0) process.exitCode = 2;
+      break;
+    }
+    case "runs": {
+      const limit = values.limit ? Number(values.limit) : undefined;
+      if (limit !== undefined && (!Number.isInteger(limit) || limit < 1)) {
+        throw new Error("--limit must be a positive integer");
+      }
+      const all = workspace().runs(need(a, "asset"));
+      const items = limit !== undefined ? all.slice(0, limit) : all;
+      if (values.json) {
+        out(items);
+        break;
+      }
+      table(
+        items.map((r) => ({
+          id: r.id,
+          asOf: r.asOf,
+          status: r.status,
+          openBreaks: r.openBreaks,
+        })),
+      );
+      break;
+    }
+    case "run": {
+      const concord = workspace();
+      const id = Number(need(a, "run id"));
+      if (!Number.isSafeInteger(id) || id < 1) throw new Error("run id must be a positive integer");
+      printRun(concord.run(id));
+      break;
+    }
     case "action": {
       const type = need(b, "action type") as ActionInput["type"];
       const input: ActionInput = { type, recordTime: need(values.record, "--record"), exclude: list(values.exclude) };
@@ -337,13 +424,59 @@ async function main(): Promise<void> {
       }
       break;
     }
+    case "signoff": {
+      const asset = need(a, "asset");
+      const scope = need(values.scope, "--scope");
+      const key = need(values.key, "--key");
+      const rawStatus = need(values.status, "--status");
+      if (!/^(recon|controls|action:[1-9]\d*)$/.test(scope)) {
+        throw new Error("--scope must be recon, controls, or action:N (N a positive integer)");
+      }
+      if (!["open", "acknowledged", "resolved"].includes(rawStatus)) {
+        throw new Error("--status must be open, acknowledged, or resolved");
+      }
+      const status = rawStatus as "open" | "acknowledged" | "resolved";
+      // A note is required to acknowledge or resolve a break; reopening needs none.
+      const note = values.note ?? "";
+      if (status !== "open" && !note.trim()) throw new Error(`--note is required when --status is ${status}`);
+      const concord = workspace();
+      const assetRecord = concord.asset(asset);
+      let breaks: Array<{ key: string; fingerprint: string }>;
+      if (scope === "recon") {
+        const r = values.run !== undefined ? concord.run(Number(values.run)) : concord.latestRun(assetRecord.id);
+        if (!r) throw new Error("no reconciliation run found for this asset");
+        breaks = r.breaks;
+      } else if (scope === "controls") {
+        breaks = concord.controls(assetRecord.id).breaks;
+      } else {
+        breaks = concord.action(Number(scope.slice("action:".length))).result?.breaks ?? [];
+      }
+      const brk = breaks.find((x) => x.key === key);
+      if (!brk) throw new NotFound(`no break ${key} in the current ${scope.split(":")[0]} results`);
+      concord.setNote(asset, scope, key, { fingerprint: brk.fingerprint, status, note }, actor);
+      if (values.json) return out({ ok: true, asset, scope, key, status });
+      console.log(`signed off: ${key} → ${status.toUpperCase()}`);
+      break;
+    }
     default:
       throw new Error(`unknown command "${command}"\n\n${USAGE}`);
   }
-  runtime.close();
+  } finally {
+    runtime.close();
+  }
 }
 
-main().catch((err: Error) => {
-  console.error(err.message);
-  process.exit(1);
-});
+function isEntry(): boolean {
+  try {
+    return import.meta.url === pathToFileURL(realpathSync(process.argv[1] ?? "")).href;
+  } catch {
+    return false;
+  }
+}
+
+if (isEntry()) {
+  runCli().catch((err: Error) => {
+    console.error(err.message);
+    process.exit(1);
+  });
+}
